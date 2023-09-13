@@ -1,0 +1,403 @@
+/**********************************************************************************
+*																					*
+* FILE NAME:																		*
+*   ModeBusProtocol.c																			*
+*																					*
+* DESCRIPTION:																		*
+*   This file contains all routines for the DLT 465 protocol                      *
+* HISTORY																			*
+*   Ferlandes Yossi																	*
+* - CREATION      																	*
+*   Yossi Ferlandes 19/11/2009														*
+*                                                                                  *
+***********************************************************************************/
+#include <stdint.h>
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include "utils.h"
+#define PULSER_PROTOCOL_H
+#include "DLTprotocol.h"
+#include "PulserProtocol.h"
+//#include "FLASH_Program.h"
+#include "hal_data.h"
+#include "flash_lp_ep.h"
+extern void SendData2Modem(uint8_t * DataIn, uint16_t Len);
+//extern void RTC_CalendarConfig(TimeStruct *tm);
+uint8_t PP_CompareDI(uint8_t DLTid, uint8_t *RxData);
+uint8_t PP_SendMsg2Server(uint8_t * pMsgOut,uint8_t *pDLTDdata, uint8_t DLTDdataLen,uint8_t DLTid);
+uint8_t Pulser_State = PP_DISCONNECT_STATE;
+/* RTC Instance. */
+//extern const rtc_instance_t yos1_RTC;
+//extern RTC_HandleTypeDef RTCHandle;
+/************************************************************************************
+1.	Message Format
+
+[23-5E-DT-23]-[68]-[AA-AA-AA-AA-AA-AA]-[68]-[MT-MT]-[DL]-[DATA]-[CS]-[16]
+
+23-5E-DT-23	Pulse Coordinator Identification
+68		DLT Byte
+AA-..-AA	Meter Address/ID
+68		DLT Byte
+MT-MT		Message Type
+DL		Data Length
+DATA		Message Data
+CS		Checksum
+16		DLT Byte
+
+
+Message Types
+Message type is the command code for specific function. Like DI and Function Code.
+Type	Description
+00-00	Data Response
+0A-00	Daily Data
+09-00	Alert
+�	�
+01-FF	ACK
+02-FF	NACK
+***********************************************************************************/
+/* local vars defenitions ***********************************************************/
+#pragma pack(1)
+uint32_t PP_ExtractDlt(uint8_t *pMsgIn, uint16_t len);
+uint8_t PP_CompareDI(uint8_t DLTid, uint8_t *RxData);
+extern RepeaterConfigStruct RepeaterConfig;
+extern void  Error_UartMETERHandler(void);
+bool CovertBcd2Add(uint8_t *BtmpIn ,   long long  * Maddress);
+unsigned char const pulserID[] = {   0,0,         //Data Response
+                                     0xa,0,         //Daily Data
+                                     9,0,         //Alert
+                                     1,0xff,      //ACK
+                                     2,0xff       //NACK
+};	
+const uint8_t PulserClientIdentification[4] = {0x23, 0x5e, 0x12, 0x23};  // start message when   meter -->  server
+const uint8_t PulserServerIdentification[4] = {0x23, 0x5e, 0xff, 0x23};  // start message when   server --> meter
+uint8_t Event_status[2];
+/************************************************************************************/
+/*                                                                                  */
+/* - FUNCTION        : ExtractDlt                                                   */
+/* - DESCRIPTION     : this routine is called whenever a message is received from   */
+/*                    Gprs/Tcp towards meter.                                       */
+/* - INPUT           : Len - size of input data                                     */
+/*                     pDataIn - pointer to input data buf                          */
+/* - OUTPUT          : none.                                                        */
+/* - CHANGES         :                 						    */
+/* - CREATION     24.01.2020     						    */
+/*   Ferlandes Yossi                                                                */
+/*                                                                                  */
+/************************************************************************************/
+uint32_t PP_ExtractDlt(uint8_t *pMsgIn, uint16_t len)
+{
+  uint8_t btmp[255];
+  PulserStaruct *pMsg;
+  pMsg = (PulserStaruct*)btmp;  
+  PulserConnectionRes  *PConRes; 
+  PulserDataRes *pDataRes;
+  uint16_t size;
+    if ( PP_ParseRxMsg(pMsgIn, btmp, &size))
+    {
+      switch (Pulser_State)
+      {
+          case PP_DISCONNECT_STATE:
+            // no operation is alowd in this state skip message 
+          break;
+          case PP_CONNECTION_REQ_STATE:
+             PConRes = (PulserConnectionRes*)pMsg->Info;
+             if (PConRes->Err_code == 0x0)   //connection success 
+             {
+               // for this stage we are requiring the pendig flag and go direct to sending daily data
+               PP_SendDailyData();
+               Pulser_State = PP_DAILY_DATA_STATE;
+               
+#ifdef DEBUG_UART_MODE1
+
+            R_SCI_UART_Write(&Debug_Uart1_ctrl,"Receive ack for login OK\r\n" ,31);
+//            R_BSP_SoftwareDelay(1000, bsp_delay_units); // delay 1 sec temp to be removed
+
+#endif               
+               return 1;
+             }
+             else
+             {
+#ifdef DEBUG_UART_MODE1
+
+            R_SCI_UART_Write(&Debug_Uart1_ctrl,"Receive ack WITH ERR for login OK\r\n" ,34);
+//            R_BSP_SoftwareDelay(1000, bsp_delay_units); // delay 1 sec temp to be removed
+
+#endif               
+               return 0; // Has to retru connection req 
+             }
+        break;
+        case PP_DAILY_DATA_STATE:
+          pDataRes = (PulserDataRes*)pMsg->Info;
+          //RTC_CalendarConfig(&pDataRes->Time);
+
+          rtc_time_t TimeSet;
+
+          R_RTC_CalendarTimeGet(&Yos1_RTC_ctrl,&TimeSet);
+
+          ;     /*!< Specifies the RTC Date Year.
+                                 This parameter must be a number between Min_Data = 0 and Max_Data = 99 */
+          TimeSet.tm_year = pDataRes->Time.Year;
+          TimeSet.tm_mon  = pDataRes->Time.Month;    /*!< Specifies the RTC Date Month (in BCD format).
+                                 This parameter can be a value of @ref RTC_Month_Date_Definitions */
+
+          TimeSet.tm_mday= pDataRes->Time.Date;     /*!< Specifies the RTC Date.
+                                 This parameter must be a number between Min_Data = 1 and Max_Data = 31 */
+
+          TimeSet.tm_hour= pDataRes->Time.Hours;            /*!< Specifies the RTC Time Hour.
+                                         This parameter must be a number between Min_Data = 0 and Max_Data = 12 if the RTC_HourFormat_12 is selected.
+                                         This parameter must be a number between Min_Data = 0 and Max_Data = 23 if the RTC_HourFormat_24 is selected */
+
+          TimeSet.tm_min =pDataRes->Time.Minutes;          /*!< Specifies the RTC Time Minutes.
+                                         This parameter must be a number between Min_Data = 0 and Max_Data = 59 */
+
+          TimeSet.tm_sec=  pDataRes->Time.Seconds;
+
+
+          R_RTC_CalendarTimeSet(&Yos1_RTC_ctrl,&TimeSet);
+          if (pDataRes->MisingDays )
+          {
+            // t.b.d
+          }
+          if (pDataRes->KeepConnection == 0)
+          {
+            // end of session go back to sleep 
+            Pulser_State = PP_DISCONNECT_STATE;
+#ifdef DEBUG_UART_MODE1
+
+            R_SCI_UART_Write(&Debug_Uart1_ctrl,"Receive ack for daily data keep alive = 0 OK\r\n" ,44);
+//            R_BSP_SoftwareDelay(1000, bsp_delay_units); // delay 1 sec temp to be removed
+
+#endif               
+            return 1;
+          }
+#ifdef DEBUG_UART_MODE1
+
+            R_SCI_UART_Write(&Debug_Uart1_ctrl,"Receive ack for daily data keep alive = 1 OK\r\n" ,44);
+//            R_BSP_SoftwareDelay(1000, bsp_delay_units); // delay 1 sec temp to be removed
+
+#endif              
+      }
+     }
+    return 0;
+}
+
+
+
+/************************************************************************************/
+/*                                                                                  */
+/* - FUNCTION        : PP_ParseRxMsg                                                */
+/* - DESCRIPTION     : this routine parse the incoming message recived from Server  */
+/* - INPUT           : pDltPayload. Len of string                                   */
+/* - OUTPUT          : none.                                                        */
+/* - CHANGES         :                 						    */
+/* - CREATION     5/12/2021      						    */
+/*   Ferlandes Yossi                                                                */
+/*                                                                                  */
+/************************************************************************************/
+uint8_t PP_ParseRxMsg(uint8_t   *pDLTMsg, uint8_t   *pDLTDdata, uint16_t *pRxMsgLen)
+{
+  uint16_t bInd;
+  PulserStaruct *pMsg;
+  long long bTmpAdd  =0;
+  uint8_t CheckSum  =0;
+  for (bInd = 0 ; bInd < MAX_UART_SIZE; bInd++)
+  { // search for identificatio string
+    pMsg = (PulserStaruct*)(pDLTMsg+bInd);
+    if (memcmp((char*)pMsg,(char*)PulserServerIdentification,sizeof(PulserServerIdentification))==0)
+    break;   // Pulser Identification found
+  }
+    if (bInd >= MAX_UART_SIZE ) return 0;  // no stx found
+  if ((pMsg->Header.Stx != 0x68) && (pMsg->Header.Stx1 != 0x68) && (pMsg->Info[pMsg->Header.Len +1] !=0x16)  )  return 0;
+// y.f. Check if meassge if for this meter  
+  for(bInd=0;bInd<6;bInd++)
+  {
+ //   EMConfigMacADDR0[bInd] =  pMsg->Header.Add[5-bInd];
+    bTmpAdd = bTmpAdd*100;
+    bTmpAdd = bTmpAdd + ConvertBCD2Hex(pMsg->Header.Add[5-bInd]);     //   Convert add from bcd+0x33 to long long 
+  }  
+  if (bTmpAdd != RepeaterConfig.ExtendedAddress) return 0;  // Message not for this meter
+  
+  
+  // calculate C.S.
+  for (bInd = 0 ; bInd < pMsg->Header.Len+ sizeof(PulserHeaderStaruct)  ; bInd++)
+    CheckSum = CheckSum + ((unsigned char*) pMsg)[bInd];
+  // c.s. error
+  if (CheckSum != ((unsigned char *)pMsg)[pMsg->Header.Len+ sizeof(PulserHeaderStaruct)]) return 0;
+  // copy the rx data 
+  *pRxMsgLen = pMsg->Header.Len+ sizeof(PulserHeaderStaruct)+2;
+  memcpy ((unsigned char *)pDLTDdata, (unsigned char *) pMsg,*pRxMsgLen);
+  return (1);
+}
+
+/*********************************************************************************************/
+/*                                                                                           */
+/* - FUNCTION        : PP_SendDailyData                                                      */
+/*                                                                                           */
+/* - DESCRIPTION   :[Description for Daily Data (as [DATA]):                                 */
+/*                  [DD-MM-YY]-[PF]-[RR-RR-RR-RR]-                                           */
+/*                  [CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC-CC]*/
+/*                   -[PR-PR-PR-PR]-[BB-BB-BB-BB]-[ER-ER]                                    */
+/*                  DD-MM-YY		Date of daily data                                   */
+/*                  PF			Pulse Factor 			                     */
+/*                  RR-RR-RR-RR		Consumption Cumulative Reading                       */
+/*                  CC-CC-�-CC-CC		24-Hourly Consumption (0-23)                 */
+/*                  PR-PR-PR-PR		Pressure Measurement                                 */
+/*                  BB-BB-BB-BB		Prepayment Balance                                   */
+/*                  ER-ER			Event Record                                 */
+/*                                                                                           */
+/* - INPUT           :  none                                                                 */
+/* - OUTPUT          :  pDltPayload. Len of string                                           */
+/* - CHANGES         :                 						             */
+/* - CREATION     14/2/22       						             */
+/*   Ferlandes Yossi                                                                         */
+/*                                                                                           */
+/*********************************************************************************************/
+uint8_t PP_SendDailyData(void)
+{ 
+ // RTC_DateTypeDef TempDate;
+  rtc_time_t inittime;
+  static uint8_t btmp[255];
+  uint16_t bInd;
+  uint8_t CheckSum  =0;
+  PulserStaruct *pMsg;
+  pMsg = (PulserStaruct*)btmp;  
+  PulserDailyData   *PulserDaily;
+  PulserDaily = (PulserDailyData*)pMsg->Info;
+  memcpy ((char*)pMsg,PulserClientIdentification,sizeof(PulserClientIdentification));
+  long long address =  RepeaterConfig.ExtendedAddress;
+  pMsg->Header.Stx  = 0x68;
+  pMsg->Header.Stx1 = 0x68;
+  for (bInd = 0; bInd < 6 ; bInd++)
+  {   // Convert hex addres to little endiann BCD 
+    pMsg->Header.Add[bInd] = ConvertHex2BCD(address % 100);
+    address = address/100;
+  } 
+  pMsg->Header.MessaggeType[0] = 0xa;
+  pMsg->Header.MessaggeType[1] = 0;
+  pMsg->Header.Len             = 0x2a;
+  PulserDaily->Etx             = 0x16;
+  
+  R_RTC_CalendarTimeGet(&Yos1_RTC_ctrl, &inittime);
+  PulserDaily->Day = ConvertHex2BCD( inittime.tm_mday)+0x33;
+  PulserDaily->Month = ConvertHex2BCD(inittime.tm_mon) +0x33;
+  PulserDaily->Year = ConvertHex2BCD(inittime.tm_year)+0x33;
+
+
+ // HAL_RTC_GetDate(&RTCHandle , &TempDate, RTC_FORMAT_BCD );
+//  PulserDaily->Day = ConvertHex2BCD( TempDate.Date)+0x33;
+ // PulserDaily->Month = ConvertHex2BCD(TempDate.Month) +0x33;
+ // PulserDaily->Year = ConvertHex2BCD(TempDate.Year)+0x33;
+  PulserDaily->PF= 0x34; // t.b.d.
+  for (bInd = 0; bInd < 24 ; bInd++)
+  { // Convert hex total houur consumptio to little endiann BCD 
+     PulserDaily->HourConsumption[bInd] =ConvertHex2BCD(RepeaterConfig. Consumption.HoursConsumption[bInd])+0x33;
+  }
+  address = RepeaterConfig.Consumption.TotalConsumption;
+  
+  for (bInd = 0; bInd < 4 ; bInd++)
+  {   // Convert hex total consumtion to little endiann BCD 
+    PulserDaily->TotalConsumption[bInd] = ConvertHex2BCD(address % 100)+0x33;
+    address = address/100;
+  } 
+  for (bInd = 0; bInd < 4 ; bInd++)
+  {//t.b.d
+    PulserDaily->Pressure[bInd]=0x33;
+  }
+  for (bInd = 0; bInd < 4 ; bInd++)
+  {//t.b.d.
+    PulserDaily->PrepaymentBalance[bInd]=0x33;
+  }
+  for (bInd = 0; bInd < 2 ; bInd++)
+  {//t.b.d
+    PulserDaily->EventRecord[bInd]=Event_status[bInd];
+  }
+  for (bInd = 0 ; bInd < pMsg->Header.Len+ sizeof(PulserHeaderStaruct)  ; bInd++)
+    CheckSum= CheckSum + ((unsigned char*) pMsg)[bInd];
+  PulserDaily->cs=CheckSum;
+  SendData2Modem(btmp,sizeof(PulserHeaderStaruct)+sizeof(PulserDailyData));  
+ return 1; 
+}
+/*************************************************************************************/
+/*                                                                                   */
+/* - FUNCTION        : PP_ReqConnectionFromServer                                    */
+/*                                                                                   */
+/* - DESCRIPTION   :[23]-[5E]-[DT]-[23]-[YY-NN-NN]-[FW]-[AA-AA-AA-AA-AA-AA]-[CS]-[16]*/
+/*   23		Pulser Protocol Byte                                                */
+/*   5E		Pulser Classification                                               */
+/*   DT		Pulser Device Type                                                  */
+/*   23		Pulser Protocol Byte                                                */
+/*   YY-NN-NN	Pulser ID (Year + SN)                                               */
+/*   FW		Pulser Firmware Version                                             */
+/*   AA-..-AA	Meter ID/Address                                                    */
+/*   CS		Checksum                                                            */
+/* - INPUT           :  none                                                        */
+/* - OUTPUT          :  pDltPayload. Len of string                                  */
+/* - CHANGES         :                 						    */
+/* - CREATION     5/12/21         						    */
+/*   Ferlandes Yossi                                                                */
+/*                                                                                  */
+/************************************************************************************/
+void PP_ReqConnectionFromServer(void)
+{ 
+//  long long Maddress=0; 
+  uint16_t bInd;
+  uint8_t CheckSum  =0;
+  PulserReqConnection *pMsg;
+  uint8_t DLTDdata[250]; 
+  pMsg = (PulserReqConnection*)DLTDdata;
+  Pulser_State = PP_CONNECTION_REQ_STATE;
+  memcpy ((char*)pMsg,PulserClientIdentification,sizeof(PulserClientIdentification));
+  pMsg->version = FirmwareVersion;      // etx
+  long long address =  RepeaterConfig.ExtendedAddress;
+  for (bInd = 0; bInd < 6 ; bInd++)
+  {   // Convert hex addres to little endiann BCD 
+    pMsg->Add[bInd] = ConvertHex2BCD(address % 100);
+    address = address/100;
+  }
+  address =   RepeaterConfig.ExtendedAddress %10000;
+  pMsg->ModelId[0]=0x22;
+  pMsg->ModelId[1] = ConvertHex2BCD(address % 100);
+  address = address/100;
+  pMsg->ModelId[2] = ConvertHex2BCD(address % 100);
+  for (bInd = 0; bInd < sizeof(PulserReqConnection)-2; bInd++)
+    CheckSum = CheckSum + DLTDdata[bInd];
+  pMsg->cs = CheckSum;
+  pMsg->Etx = 0x16;      // etx   
+  SendData2Modem(DLTDdata,sizeof(PulserReqConnection));  
+}
+
+
+/************************************************************************************/
+/*                                                                                  */
+/* - FUNCTION        : uint8_t PP_CompareDI(uint8_t DLTid)   		    */
+/* - DESCRIPTION     : this routine compares DI field in receiver buffer with       */
+/*                     parameter DLTid                                              */
+/* - INPUT           : DLTid                                                        */
+/* - OUTPUT          : 0 if equals, 1 if notequal                                   */
+/* - CHANGES         :                                                              */               											    
+/*                                                                                 */
+/************************************************************************************/
+uint8_t PP_CompareDI(uint8_t DLTid, uint8_t *RxData)
+{
+	uint8_t result = 0;
+	uint16_t bInd;
+	PulserStaruct *pMsg;
+	pMsg = (PulserStaruct*)RxData;
+        memcpy ((char*)pMsg,PulserClientIdentification,sizeof(PulserClientIdentification));
+	for (bInd = 0; bInd < 2 ; bInd++)
+	{
+//	  if(pMsg->Header.MessaggeType[2-bInd] != (uint8_t)(pulserID[DLTid*2+bInd] +0x33)){
+ 	  if(pMsg->Header.MessaggeType[bInd] != (uint8_t)(pulserID[DLTid*2+bInd] )){
+		result = 1;
+		break;
+	  }
+	} 
+	return result;
+}
+
+
+
+
+          

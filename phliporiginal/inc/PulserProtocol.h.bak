@@ -1,0 +1,102 @@
+/****************************************************************************************
+* ModeBusProtocol.H 																			   	*
+* DESCRIPTION:																		   	*
+*   This file contains ALL 	ModeBusProtocol packet exported routints and definitions .  
+*
+*																					   	*
+* HISTORY																			 	*
+*   Ferlandes Yossi   22/11/2009     Created										  		*
+****************************************************************************************/
+#ifndef _PULSER_PROTOCOL_H
+#define _PULSER_PROTOCOL_H
+
+#undef PUBLIC
+#ifdef PULSER_PROTOCOL_H
+#define  PUBLIC
+#else
+#define  PUBLIC  extern
+#endif
+
+#pragma pack(1)
+
+
+typedef struct  {
+  uint8_t Identification[4]; 
+  uint8_t Stx;
+  uint8_t Add[6];
+  uint8_t Stx1;
+  uint8_t MessaggeType[2];
+  uint8_t Len;
+}PulserHeaderStaruct;
+  
+typedef struct  {
+  uint8_t Identification[4]; 
+  uint8_t ModelId[3];
+  uint8_t version;
+  uint8_t Add[6];
+  uint8_t cs;
+  uint8_t Etx;
+}PulserReqConnection;
+
+typedef struct  {
+  uint8_t       Day;
+  uint8_t       Month;
+  uint8_t       Year;
+  uint8_t       PF;
+  uint8_t       TotalConsumption[4];
+  uint8_t       HourConsumption[24];
+  uint8_t       Pressure[4];
+  uint8_t       PrepaymentBalance[4];
+  uint8_t       EventRecord[2];
+  uint8_t       cs;
+  uint8_t       Etx;
+}PulserDailyData;
+ 
+  
+typedef struct  {
+  uint8_t Err_code;
+  uint8_t PendingFunction;
+  uint8_t Cs;
+  uint8_t Etx;
+}PulserConnectionRes;
+
+typedef struct  {
+  TimeStruct Time;
+  uint8_t MisingDays;
+  uint8_t KeepConnection;
+  uint8_t Cs;
+  uint8_t Etx;
+
+}PulserDataRes;
+
+typedef struct
+{
+ PulserHeaderStaruct Header;
+ uint8_t Info[255]; 
+}PulserStaruct;
+
+
+typedef enum
+{
+ PP_DISCONNECT_STATE = 0,
+ PP_CONNECTION_REQ_STATE,
+ PP_DAILY_DATA_STATE,
+ PP_ALERT_STATE
+}PulserState;
+
+
+typedef enum
+{
+ DATA_RESP_COMMAND = 0,
+ DAILY_DATA_COMMAND,
+ ALERT_COMMAND,
+ ACK_COMMAND,
+ NACK_COMMAND
+}PulserDIname;
+
+PUBLIC uint8_t PP_ParseRxMsg(uint8_t   *pDLTMsg, uint8_t   *pDLTDdata, uint16_t *pRxMsgLen);
+PUBLIC void PP_ReqConnectionFromServer(void);
+PUBLIC uint8_t PP_SendDailyData(void);
+
+
+#endif

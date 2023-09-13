@@ -1,0 +1,651 @@
+#include "hal_data.h"
+#include "main.h"
+#include "flash_lp_ep.h"
+FSP_CPP_HEADER
+void R_BSP_WarmStart(bsp_warm_start_event_t event);
+FSP_CPP_FOOTER
+RepeaterConfigStruct RepeaterConfig;
+rtc_time_t LastPulseTime;
+bool IncPulseFlag = false;
+bool toggle = false;
+void ToggleLeds(void);
+void SetLed(ioport_port_pin_t pin_num, bool STATE);
+void SendData2Modem(uint8_t *DataIn, uint16_t Len);
+void HourProcess(int hour);
+void modemProcess(void);
+void RTC_Alarm_Set(void);
+void ModemSequence(ModemModeSequence ModeSeq);
+void DelayYos(uint32_t Timems);
+void EnterDefaultConfig(void);
+void EnterDefaultTime(void);
+void ResetConsumptionData(uint32_t consumption);
+uint32_t Start_ADC_VBAT(void);
+uint32_t TmpHourConsmption; // y.f. 18/5/22
+
+static bool MagnetDetect = false;
+uint32_t Vbat_val;
+uint32_t UploadTime;
+static int8_t min_counter = 0; // y.f. to be removed for test only
+extern fsp_err_t Uarts_Initialize(void);
+extern fsp_err_t Uarts_Close(void);
+extern int8_t tmpbufout[];  // to be removed
+extern fsp_err_t flash_lp_init(void);
+extern uint8_t GsmCompleateStatus(void);
+extern void ClrGsmCompleate(void);
+extern void Gsm_Init(void);
+extern bool FLashCheck(void);
+extern uint32_t TimingDelay;
+extern uint8_t Event_status[];
+uint8_t modem_seq_state = 0;
+uint32_t conttemp = 0;
+bool ready_to_read = false;
+const bsp_delay_units_t bsp_delay_units = BSP_DELAY_UNITS_MILLISECONDS;
+const uint32_t delay = 5; // 10 sec y.f.
+DailyData DailyConsumption[MAX_LOGGER_DAYS]; // count will increase if external flash is avalable
+rtc_time_t CurrentTime;
+bool write_internal_config_flag = false;
+bool write_internal_logger_flag = false;
+#ifdef DEBUG_UART_MODE
+    char  str1[20];
+#endif
+void ClrLeds(void);
+
+/* Temporary buffer to save data from receive buffer for further processing */
+extern uint8_t g_LTE_temp_buffer[] ;
+/* Counter to update g_temp_buffer index */
+//extern uint32_t g_LTE_counter_var;
+extern bool g_LTE_data_received_flag;
+extern bool g_LTE_time_out_flag;
+#ifdef DEBUG_UART_MODE
+uint32_t Ltutmpindexin;
+uint8_t Ltutemputartin[MAX_UART_SIZE];
+uint32_t Ltutmpindexout;
+uint8_t Ltutemputartout[MAX_UART_SIZE];
+#endif
+
+void hal_entry(void)
+{
+    fsp_err_t status;
+    lvd_status_t p_lvd_status;
+    adc_status_t *p_status;
+    R_BSP_SoftwareDelay (2000, bsp_delay_units); // delay 1 sec
+    status = R_LVD_Open (&Battery_g_lvd_ctrl, &Battery_g_lvd_cfg);
+    status = R_RTC_Open (&Yos1_RTC_ctrl, &Yos1_RTC_cfg);
+    status = R_LPM_Open (&Meter_g_lpm0_ctrl, &Meter_g_lpm0_cfg);
+    status = R_ICU_ExternalIrqOpen (&magnet_detect_ctrl, &magnet_detect_cfg);
+    status = R_ICU_ExternalIrqEnable (&magnet_detect_ctrl);
+    status = R_ICU_ExternalIrqOpen (&Puls_g_external_irq0_ctrl, &Puls_g_external_irq0_cfg);
+    status = R_ICU_ExternalIrqEnable (&Puls_g_external_irq0_ctrl);
+    status = R_AGT_Open (&Pulser_Timer0_Generic_ctrl, &Pulser_Timer0_Generic_cfg);
+    status = R_AGT_Enable (&Pulser_Timer0_Generic_ctrl);
+    status = R_ADC_Open (&g_adc0_Vbat_ctrl, &g_adc0_Vbat_cfg);
+    Uarts_Initialize (); // Init both uarts DEBUG & LTE
+    status = R_SCI_UART_Write (&Debug_Uart1_ctrl, "Debug Port version 1.01 water meter pulser", 45);
+    flash_lp_init ();
+    if (FLashCheck () == false)
+    { //first time or flash corrupted
+        EnterDefaultConfig ();
+        ResetConsumptionData(0);
+        WriteInternalFlashConfig(0,LOGGER_DATA); // store the configuration
+    }
+    else
+        GetDailyLoggerALLFromFlash ();
+//    EnterDefaultTime ();
+    RTC_Alarm_Set();
+ //   SetLed (PULSER_LED1, true);
+ //   SetLed (PULSER_LED2, true);
+    //ClrLeds();
+    modemProcess (); // send daily data to SERVER once a day and at init and magnet detect
+    while (1)
+    {
+           status = R_AGT_Start (&Pulser_Timer0_Generic_ctrl);
+           status = R_RTC_CalendarTimeGet (&Yos1_RTC_ctrl, &CurrentTime);
+           status = R_ADC_Open (&g_adc0_Vbat_ctrl, &g_adc0_Vbat_cfg);
+           status = R_LVD_StatusGet (&Battery_g_lvd_ctrl, &p_lvd_status);
+           if (p_lvd_status.current_state == 0)
+           {
+#ifdef DEBUG_UART_MODE
+                R_SCI_UART_Write (&Debug_Uart1_ctrl, "Battery Low Detect\r\n", 15);
+                R_BSP_SoftwareDelay (100, bsp_delay_units); // delay 1 sec temp to be removed
+#endif
+                Event_status[0] |= LOW_BATTERY_DETECT;
+           }
+            Vbat_val = Start_ADC_VBAT ();
+            if (MagnetDetect)
+            {
+                 MagnetDetect = false;
+                 Event_status[0] |= MAGNET_DETECT;
+ #ifdef DEBUG_UART_MODE
+                 R_SCI_UART_Write (&Debug_Uart1_ctrl, "Magnet Detect\r\n", 15);
+                 R_BSP_SoftwareDelay (100, bsp_delay_units); // delay 1 sec temp to be removed
+ #endif
+                 modemProcess(); // start connection to server when magnet detect
+            }
+
+            if (CurrentTime.tm_min % 15 == 0) // start  in midnight
+            {
+                HourProcess (CurrentTime.tm_hour);
+            }
+            if  (write_internal_config_flag == true) // 14/6/22 temp use flag instead of direct write internal
+            {
+                write_internal_config_flag = false;
+                WriteInternalFlashConfig(0,CONFIG_DATA); // store the configuration
+            }
+            if  (write_internal_logger_flag == true) // 14/6/22 temp use flag instead of direct write internal
+             {
+                write_internal_logger_flag = false;
+                WriteInternalFlashConfig(0,LOGGER_DATA); // store the configuration
+             }
+
+            status = R_AGT_Stop (&Pulser_Timer0_Generic_ctrl); // y.f.  stop timer 0 before entering to sleep mode
+            Uarts_Close ();
+            ClrLeds();
+            R_LPM_LowPowerModeEnter(&Meter_g_lpm0_ctrl);
+            // wake up from sleep
+            Uarts_Initialize ();
+#ifdef DEBUG_UART_MODE
+            sprintf (str1, "pulses count = %d", RepeaterConfig.Consumption.TotalConsumption);
+            R_SCI_UART_Write (&Debug_Uart1_ctrl, str1, 20);
+            R_BSP_SoftwareDelay (100, bsp_delay_units); // delay 1 sec temp to be removed
+#endif
+        }
+#if 0
+        //temp removed              if (((CurrentTime.tm_min==0) && (CurrentTime.tm_sec==0)) || MagnetDetect)
+        {
+            status = R_ADC_ScanCfg (&g_adc0_Vbat_ctrl, &g_adc0_Vbat_channel_cfg);
+            if (MagnetDetect)
+                Event_status[0] |= MAGNET_DETECT;
+
+            status = R_LVD_StatusGet (&Battery_g_lvd_ctrl, &p_lvd_status);
+            if (p_lvd_status.current_state == 0)
+                Event_status[0] |= LOW_BATTERY_DETECT;
+            TmpHourConsmption = CurrentTime.tm_min;  // temp for test to be removed 24/5/22
+            HourProcess (CurrentTime.tm_hour);
+            Vbat_val = Start_ADC_VBAT ();
+            // temp reoved              if (CurrentTime.tm_hour==0) // start  in midnight
+            //                             if (CurrentTime.tm_min % 3 ==0) // start  in midnight
+            R_BSP_SoftwareDelay (3000, bsp_delay_units); // delay 1 sec                               {
+            //          WriteInternalFlashConfig(0,LOGGER_DATA);
+            // temp removed check renesas new vbat process    int vbat_value = adc_vbat_start();
+            modemProcess ();
+            //       }
+        }
+
+        // go to sleep
+        //      status = R_ADC_ScanStop(&g_adc0_Vbat_ctrl);
+        status = R_AGT_Stop (&Pulser_Timer0_Generic_ctrl); // y.f.  stop timer 0 before entering to sleep mode
+        Uarts_Close ();
+        //  status = R_LPM_Open(&Meter_g_lpm0_ctrl, &Meter_g_lpm0_cfg);
+        //        status = R_LPM_LowPowerModeEnter(&Meter_g_lpm0_ctrl);
+        // R_LPM_Close (&Meter_g_lpm0_ctrl);
+        // wake up from sleep
+        Uarts_Initialize ();
+
+        //         status =R_RTC_CalendarTimeGet(&Yos1_RTC_ctrl, &CurrentTime);
+        //          sprintf(str, "Value of sec = %d", CurrentTime.tm_sec);
+
+        status = R_ADC_Open (&g_adc0_Vbat_ctrl, &g_adc0_Vbat_cfg);
+    }
+#endif
+
+}
+
+void HourProcess(int hour)
+{
+    // enter to flash
+    char str[10];
+
+    RepeaterConfig.Consumption.HourConsumption[hour] = TmpHourConsmption;
+    R_ICU_ExternalIrqDisable (&Puls_g_external_irq0_ctrl);
+    TmpHourConsmption = 0; // This parameters is modified in pulse isr
+    R_ICU_ExternalIrqEnable (&Puls_g_external_irq0_ctrl);
+    //     WriteInternalFlashConfig(0,CONFIG_DATA); // store the configuration
+    write_internal_logger_flag = true; // 14/6/22 temp use flag instead of direct write internal
+    if (hour == 0)
+    {
+        modemProcess (); // send daily data to SERVER once a day.
+    }
+
+
+#ifdef DEBUG_UART_MODE
+    uint32_t tt;
+    tt = RepeaterConfig.Consumption.HourConsumption[hour];
+    sprintf (str, "hour= %d", tt);
+    R_SCI_UART_Write (&Debug_Uart1_ctrl, str, 10);
+
+#endif
+}
+
+void modemProcess(void)
+{
+    ModemSequence (MODEM_START_SEQUENCE);
+    while (GsmCompleateStatus ())
+    {
+#ifdef DEBUG_UART_MODE
+        if (Ltutmpindexin)
+        {
+
+            R_SCI_UART_Write (&Debug_Uart1_ctrl, Ltutemputartin, Ltutmpindexin);
+            R_BSP_SoftwareDelay (100, bsp_delay_units); // delay 1 sec                               {
+
+            Ltutmpindexin=0;
+        }
+        if (Ltutmpindexout)
+        {
+
+            R_SCI_UART_Write (&Debug_Uart1_ctrl, Ltutemputartout, Ltutmpindexout);
+            R_BSP_SoftwareDelay (100, bsp_delay_units); // delay 1 sec                               {
+
+            Ltutmpindexout=0;
+        }
+
+#endif
+    }
+    ModemSequence (MODEM_STOP_SEQUENCE);
+
+}
+
+/*******************************************************************************************************************//**
+ * This function is called at various points during the startup process.  This implementation uses the event that is
+ * called right before main() to set up the pins.
+ *
+ * @param[in]  event    Where at in the start up process the code is currently at
+ **********************************************************************************************************************/
+void R_BSP_WarmStart(bsp_warm_start_event_t event)
+{
+    if (BSP_WARM_START_RESET == event)
+    {
+#if BSP_FEATURE_FLASH_LP_VERSION != 0
+
+        /* Enable reading from data flash. */
+        R_FACI_LP->DFLCTL = 1U;
+
+        /* Would normally have to wait tDSTOP(6us) for data flash recovery. Placing the enable here, before clock and
+         * C runtime initialization, should negate the need for a delay since the initialization will typically take more than 6us. */
+#endif
+    }
+
+    if (BSP_WARM_START_POST_C == event)
+    {
+        /* C runtime environment and system clocks are setup. */
+
+        /* Configure pins. */
+        R_IOPORT_Open (&g_ioport_ctrl, g_ioport.p_cfg);
+    }
+}
+
+#if BSP_TZ_SECURE_BUILD
+
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable ();
+
+/* Trustzone Secure Projects require at least one nonsecure callable function in order to build (Remove this if it is not required to build). */
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable ()
+{
+
+}
+
+
+
+#endif
+
+/* Callback function */
+void Pulse_int_callback(external_irq_callback_args_t *p_args)
+{
+    /* TODO: add your own code here */
+    fsp_err_t status;
+    rtc_time_t CurrentTimeTmp;
+    if (p_args->channel == 5) // to be on safe side
+    { // debounce process
+        status = R_RTC_CalendarTimeGet (&Yos1_RTC_ctrl, &CurrentTimeTmp);
+        if (memcmp ((uint8_t*) &CurrentTimeTmp, (uint8_t*) &LastPulseTime, sizeof(rtc_time_t)))
+        {
+            RepeaterConfig.Consumption.TotalConsumption++;
+            TmpHourConsmption++;
+            memcpy ((uint8_t*) &LastPulseTime, (uint8_t*) &CurrentTimeTmp, sizeof(rtc_time_t));
+        }
+
+    }
+}
+
+/* Callback function */
+void yos1_rtc_callback(rtc_callback_args_t *p_args)
+{
+    /* TODO: add your own code here */
+
+    if (p_args->event == RTC_EVENT_ALARM_IRQ)
+
+        min_counter++;
+    /* TODO: add your own code here */
+
+}
+
+void ModemSequence(ModemModeSequence ModeSeq)
+{
+    R_BSP_PinAccessEnable ();
+    /* Write to this pins */
+    R_BSP_PinWrite ((bsp_io_port_pin_t) DTR, BSP_IO_LEVEL_HIGH);
+    R_BSP_PinWrite ((bsp_io_port_pin_t) LTE_VCC_ENABLE, BSP_IO_LEVEL_HIGH);
+    R_BSP_PinWrite ((bsp_io_port_pin_t) WRITE_DISABLE_LTE, BSP_IO_LEVEL_LOW);
+    R_BSP_PinWrite ((bsp_io_port_pin_t) WAKE_UP_LTE, BSP_IO_LEVEL_HIGH);
+
+    if (ModeSeq == MODEM_START_SEQUENCE)
+    {
+        ClrGsmCompleate ();
+        R_BSP_PinAccessEnable ();
+        /* Write to this pin */
+        R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_POWER_KEY_PIN, BSP_IO_LEVEL_LOW);
+
+        R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_RESET_KEY_IN, BSP_IO_LEVEL_HIGH);
+
+#if 0
+      HAL_GPIO_WritePin(MODEM_POWER_KEY_PORT, MODEM_POWER_KEY_PIN, GPIO_PIN_RESET );
+      HAL_GPIO_WritePin(MODEM_RESET_PORT, MODEM_RESET_PIN, GPIO_PIN_SET );
+#endif
+
+        R_BSP_PinAccessDisable ();
+        TimingDelay = 50;
+        modem_seq_state = 1;
+    }
+
+    else
+
+    if (ModeSeq == MODEM_STOP_SEQUENCE)
+    {
+
+        R_BSP_PinAccessEnable ();
+        /* Write to this pin */
+        R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_POWER_KEY_PIN, BSP_IO_LEVEL_HIGH);
+        R_BSP_PinAccessDisable ();
+
+#if 0
+      HAL_GPIO_WritePin(MODEM_POWER_KEY_PORT, MODEM_POWER_KEY_PIN, GPIO_PIN_SET );
+#endif
+
+        // HAL_GPIO_WritePin(MODEM_RESET_PORT, MODEM_RESET_PIN, GPIO_PIN_SET );
+        TimingDelay = 65;
+        modem_seq_state = 5;
+    }
+    else
+        switch (modem_seq_state)
+        {
+            case 0:
+            {
+
+                R_BSP_PinAccessEnable ();
+                /* Write to this pin */
+                R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_POWER_KEY_PIN, BSP_IO_LEVEL_LOW);
+
+                R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_RESET_KEY_IN, BSP_IO_LEVEL_HIGH);
+                R_BSP_PinAccessDisable ();
+
+#if 0
+          HAL_GPIO_WritePin(MODEM_POWER_KEY_PORT, MODEM_POWER_KEY_PIN, GPIO_PIN_RESET );
+          HAL_GPIO_WritePin(MODEM_RESET_PORT, MODEM_RESET_PIN, GPIO_PIN_SET );
+#endif
+
+                TimingDelay = 50;
+                modem_seq_state++;
+                break;
+
+            }
+            case 1:
+            {
+#if 0
+        HAL_GPIO_WritePin(MODEM_POWER_KEY_PORT, MODEM_POWER_KEY_PIN, GPIO_PIN_SET );
+#endif
+
+                R_BSP_PinAccessEnable ();
+                /* Write to this pin */
+                R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_POWER_KEY_PIN, BSP_IO_LEVEL_HIGH);
+                R_BSP_PinAccessDisable ();
+                TimingDelay = 3;
+                modem_seq_state++;
+                break;
+
+            }
+            case 2:
+            {
+#if 0
+        HAL_GPIO_WritePin(MODEM_RESET_PORT, MODEM_RESET_PIN, GPIO_PIN_RESET );
+#endif
+                R_BSP_PinAccessEnable ();
+                /* Write to this pin */
+                R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_RESET_KEY_IN, BSP_IO_LEVEL_LOW);
+                R_BSP_PinAccessDisable ();
+
+                TimingDelay = 47;
+                modem_seq_state++;
+                break;
+
+            }
+            case 3:
+            {
+
+                R_BSP_PinAccessEnable ();
+                /* Write to this pin */
+                R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_POWER_KEY_PIN, BSP_IO_LEVEL_LOW);
+                R_BSP_PinAccessDisable ();
+
+#if 0
+      HAL_GPIO_WritePin(MODEM_POWER_KEY_PORT, MODEM_POWER_KEY_PIN, GPIO_PIN_RESET );
+#endif
+
+                modem_seq_state++;
+                Gsm_Init ();
+                //  TimingDelay = 100;
+
+                break;
+
+            }
+            case 4:
+            {
+                // modem wake up do nothing wait for stop modem or start modem
+            }
+            case 5:
+            {
+                R_BSP_PinAccessEnable ();
+                /* Write to this pin */
+                R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_POWER_KEY_PIN, BSP_IO_LEVEL_HIGH);
+                R_BSP_PinAccessDisable ();
+
+#if 0
+       HAL_GPIO_WritePin(MODEM_POWER_KEY_PORT, MODEM_POWER_KEY_PIN, GPIO_PIN_SET );
+#endif
+
+                TimingDelay = 65;
+                modem_seq_state++;
+                break;
+
+            }
+            case 6:
+            {
+#if 0
+       HAL_GPIO_WritePin(MODEM_POWER_KEY_PORT, MODEM_POWER_KEY_PIN, GPIO_PIN_RESET );
+#endif
+                R_BSP_PinAccessEnable ();
+                /* Write to this pin */
+                R_BSP_PinWrite ((bsp_io_port_pin_t) MODEM_POWER_KEY_PIN, BSP_IO_LEVEL_LOW);
+                R_BSP_PinWrite ((bsp_io_port_pin_t) LTE_VCC_ENABLE, BSP_IO_LEVEL_LOW); // Power off ltu
+                R_BSP_PinWrite ((bsp_io_port_pin_t) WAKE_UP_LTE, BSP_IO_LEVEL_LOW);
+                R_BSP_PinAccessDisable ();
+
+                modem_seq_state = 0;
+                break;
+            }
+        }
+}
+
+void ToggleLeds(void)
+{
+    if (toggle)
+    {
+        toggle = false;
+        SetLed (PULSER_LED1, false);
+        SetLed (PULSER_LED2, true);
+    }
+    else
+    {
+        toggle = true;
+        SetLed (PULSER_LED1, true);
+        SetLed (PULSER_LED2, false);
+    }
+}
+void ClrLeds(void)
+{
+    R_BSP_PinWrite ((bsp_io_port_pin_t) PULSER_LED1, BSP_IO_LEVEL_HIGH);
+    R_BSP_PinWrite ((bsp_io_port_pin_t) PULSER_LED2, BSP_IO_LEVEL_HIGH);
+}
+void SetLed(ioport_port_pin_t pin_num, bool STATE)
+{
+    R_BSP_PinAccessEnable ();
+
+    if (pin_num == PULSER_LED1)
+    {
+        if (STATE)
+            /* Write to this pin */
+            R_BSP_PinWrite ((bsp_io_port_pin_t) PULSER_LED1, BSP_IO_LEVEL_LOW);
+
+        //     HAL_GPIO_WritePin(LED_PORT, LED_1_PIN,GPIO_PIN_RESET);
+        else
+            R_BSP_PinWrite ((bsp_io_port_pin_t) PULSER_LED1, BSP_IO_LEVEL_HIGH);
+
+        //      HAL_GPIO_WritePin(LED_PORT, LED_1_PIN,GPIO_PIN_SET);
+    }
+    else
+    {
+        if (STATE)
+            R_BSP_PinWrite ((bsp_io_port_pin_t) PULSER_LED2, BSP_IO_LEVEL_LOW);
+
+//       HAL_GPIO_WritePin(LED_PORT, LED_2_PIN,GPIO_PIN_RESET);
+        else
+            R_BSP_PinWrite ((bsp_io_port_pin_t) PULSER_LED2, BSP_IO_LEVEL_HIGH);
+
+//       HAL_GPIO_WritePin(LED_PORT, LED_2_PIN,GPIO_PIN_SET);
+    }
+    R_BSP_PinAccessDisable ();
+
+}
+void DelayYos(uint32_t TimeClock)
+{
+    uint32_t TimingDelaytmp = TimeClock;
+    while (TimingDelaytmp--)
+        ;
+
+}
+void EnterDefaultConfig(void)
+{
+
+    memset ((uint8_t*) &RepeaterConfig, 0, sizeof(RepeaterConfigStruct));
+    RepeaterConfig.ExtendedAddress = 123456789066;
+    RepeaterConfig.Moduladdress = 22789080;
+    RepeaterConfig.protocol = DLT_PROTOCOL; //DLMS_PROTOCOL;
+    RepeaterConfig.MeterSerial.BaudRate = 9600;
+    RepeaterConfig.MeterSerial.DataBit = 8;
+    RepeaterConfig.MeterSerial.Parity = NONE;
+    RepeaterConfig.MeterSerial.StopBit = 1;
+    RepeaterConfig.GSMSerial.BaudRate = 115200;
+    RepeaterConfig.GSMSerial.DataBit = 8;
+    RepeaterConfig.GSMSerial.Parity = NONE;
+    RepeaterConfig.GSMSerial.StopBit = 1;
+    RepeaterConfig.DebugSerial.BaudRate = 9600;
+    RepeaterConfig.DebugSerial.DataBit = 8;
+    RepeaterConfig.DebugSerial.Parity = NONE;
+    RepeaterConfig.DebugSerial.StopBit = 1;
+    memcpy (RepeaterConfig.GsmConfig.APN, "internet", 8);
+    // memcpy (RepeaterConfig.GsmConfig.Port ,"2334",4);
+    // memcpy (RepeaterConfig.GsmConfig.ServerIP ,"2.55.107.55",11);
+    memcpy (RepeaterConfig.GsmConfig.Port, "2334", 4);
+    memcpy (RepeaterConfig.GsmConfig.ServerIP, "31.154.79.218", 13);
+//  RepeaterConfig.Crc =  CrcBlockCalc((unsigned char*)&RepeaterConfig, sizeof(RepeaterConfigStruct)-2);
+    WriteInternalFlashConfig (0, CONFIG_DATA);
+}
+/* Callback function */
+void Battery_low_callback(lvd_callback_args_t *p_args)
+{
+    /* TODO: add your own code here */
+    // Event_status[0]|= LOW_BATTERY_DETECT;
+}
+
+/* Callback function */
+void magnet_detect_irq_callback(external_irq_callback_args_t *p_args)
+{
+    if (p_args->channel == 0) // to be on safe side
+    { // debounce process
+        MagnetDetect = true; /* TODO: add your own code here */
+    }
+}
+void RTC_Alarm_Set(void)
+{
+    fsp_err_t status;
+    rtc_alarm_time_t hour_alarm;
+    hour_alarm.mday_match = false;
+    hour_alarm.mon_match = false;
+    hour_alarm.year_match = false;
+    hour_alarm.mday_match = false;
+    hour_alarm.hour_match = false;
+    hour_alarm.sec_match = true;
+    hour_alarm.min_match = false;
+    hour_alarm.time.tm_min = 3;
+    hour_alarm.time.tm_sec = 15;
+      // y.f. every hour set alarm to wake up processsor
+    status = R_RTC_CalendarAlarmSet (&Yos1_RTC_ctrl, &hour_alarm);
+
+}
+
+void EnterDefaultTime(void)
+{
+    fsp_err_t status;
+    static rtc_time_t g_set_time =
+    { .tm_hour = 23, .tm_isdst = 0, .tm_mday = 31, .tm_min = 59, .tm_mon = 3, .tm_sec = 39, .tm_wday = 1, .tm_yday = 4,
+    .tm_year = 22 };
+    // y.f. every hour set alarm to wake up processsor
+    status = R_RTC_CalendarTimeSet (&Yos1_RTC_ctrl, &g_set_time);
+}
+
+/* Callback function */
+void Adc_Comp_callback(adc_callback_args_t *p_args)
+{
+    /* TODO: add your own code here */
+    if ((p_args->channel == ADC_CHANNEL_0) && (p_args->event == ADC_EVENT_SCAN_COMPLETE))
+        ready_to_read = true;
+}
+uint32_t Start_ADC_VBAT(void)
+{
+
+    uint32_t temp_vbat = 0;
+    ready_to_read = false;
+    R_ADC_ScanStart (&g_adc0_Vbat_ctrl);
+    R_BSP_SoftwareDelay (1000, bsp_delay_units);
+    conttemp = 0;
+    while (ready_to_read != true) // wait here till adc scan terminated.
+        //    conttemp++; // status set while process is in progress
+        //  temp_vbat = 0x55;
+        R_ADC_Read (&g_adc0_Vbat_ctrl, ADC_CHANNEL_0, &temp_vbat);
+    /** with an analog reference of 3.3 V (VAREF = VDDA) and a 1 V signal input, *****/
+    /** the converted result is (1/3.3) × 4095 = 4D9h***/
+   temp_vbat = temp_vbat * 3600 / 4095; // Accuracy  of 3 digits after the decimal point
+#ifdef DEBUG_UART_MODE
+    char str[10];
+    sprintf (str, "Vbat = %d", temp_vbat);
+    R_SCI_UART_Write (&Debug_Uart1_ctrl, str, 17);
+
+//            status = R_SCI_UART_Write(&Debug_Uart1_ctrl,str,17);
+    R_BSP_SoftwareDelay (100, bsp_delay_units); // delay 1 sec temp to be removed
+
+#endif
+    return temp_vbat;
+}
+
+void ResetConsumptionData(uint32_t consumption )
+{
+    uint8_t bInd;
+    memset ( (uint8_t*) &DailyConsumption ,0, sizeof(DailyData)*MAX_LOGGER_DAYS);
+    for(bInd=0;bInd<24;bInd++)
+    {// clear all hours of day
+        RepeaterConfig. Consumption.HourConsumption[bInd]  =0;
+    }
+    R_ICU_ExternalIrqDisable(&Puls_g_external_irq0_ctrl);
+    TmpHourConsmption=0; // clear tmp current hour;
+    RepeaterConfig.Consumption.TotalConsumption = consumption;
+    R_ICU_ExternalIrqEnable(&Puls_g_external_irq0_ctrl);
+}

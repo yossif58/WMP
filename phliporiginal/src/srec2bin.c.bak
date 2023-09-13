@@ -1,0 +1,302 @@
+/***********************************************************************************************************************
+ * File Name    : srec2Bin.c
+ * Description  : Contains data structures and functions used for converting SREC file to bin flash to scratcpade location in flash
+ **********************************************************************************************************************/
+/***********************************************************************************************************************
+ * DISCLAIMER
+
+ * This software is supplied by Renesas Electronics Corporation and is only intended for use with Renesas products. No
+ * other uses are authorized. This software is owned by Renesas Electronics Corporation and is protected under all
+ * applicable laws, including copyright laws.
+ * THIS SOFTWARE IS PROVIDED "AS IS" AND RENESAS MAKES NO WARRANTIES REGARDING
+ * THIS SOFTWARE, WHETHER EXPRESS, IMPLIED OR STATUTORY, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. ALL SUCH WARRANTIES ARE EXPRESSLY DISCLAIMED. TO THE MAXIMUM
+ * EXTENT PERMITTED NOT PROHIBITED BY LAW, NEITHER RENESAS ELECTRONICS CORPORATION NOR ANY OF ITS AFFILIATED COMPANIES
+ * SHALL BE LIABLE FOR ANY DIRECT, INDIRECT, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES FOR ANY REASON RELATED TO THIS
+ * SOFTWARE, EVEN IF RENESAS OR ITS AFFILIATES HAVE BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+ * Renesas reserves the right, without notice, to make changes to this software and to discontinue the availability of
+ * this software. By using this software, you agree to the additional terms and conditions found by accessing the
+ * following link:
+ * http://www.renesas.com/disclaimer
+ *
+ * Copyright (C) 2020 Renesas Electronics Corporation. All rights reserved.
+ ***********************************************************************************************************************/
+
+#include "hal_data.h"
+#include "stdbool.h"
+#include "main.h"
+#include "flash_lp_ep.h"
+#include "crc.h"
+#include "utils.h"
+#include "kk_srec.h"
+#include "PulserProtocol.h"
+
+static unsigned long line_number = 1UL;
+
+#define SREC_START 'S'
+#define SREC_START_HEADER '0'
+#define START_SCRATCPAD_BLOCK 34
+
+#define SREC_RECORD_TYPE_MASK 0xF0
+#define SREC_READ_STATE_MASK 0x0F
+
+enum srec_read_state {
+    READ_WAIT_FOR_START = 0,
+    READ_RECORD_TYPE,
+    READ_GOT_RECORD_TYPE,   // dummy to make for alternating "high" and "low"
+    READ_COUNT_HIGH,
+    READ_COUNT_LOW,
+    READ_DATA_HIGH,
+    READ_DATA_LOW
+};
+
+#define SCREACHPADE_SRART_ADD 0x10000
+#define FLASH_BLOCK_SIZE              2048
+//#define MAX_BYTES_IN_LINE     37
+static uint8_t block_data[FLASH_BLOCK_SIZE];
+static int flash_blocks_num = START_SCRATCPAD_BLOCK;  // start from 0x10000 scracpad area every flash code block is 2k
+static long long address_position_in_flash = SCREACHPADE_SRART_ADD;
+static uint16_t current_position_in_block = 0;
+extern PulserNewFirmwareStruct NewFirmware;
+void ClearflashBlock_Data(void)
+{
+  memset(block_data,0,2048);
+  current_position_in_block =0;
+}
+void PrepareFlashProgramming(void)
+{
+  ClearflashBlock_Data();
+  flash_blocks_num = START_SCRATCPAD_BLOCK;
+}
+
+// 1. Get 250 bytes from dlt protocol argc contains num of bytes in packet argv contains pointer to input data 
+// 2. buf is the data to enter flash code we will flash every 2k of data 
+// 3. fgets() Read line by line till end of input buffer every line is terminating with'\n'
+// 4. srec_read_bytes() analaize each line 
+const uint8_t MESSAGE_IN[]          =
+//{ "S00F0000776D705F6E63312E7372656360",0xd,0xa,"S31500000000D06C00209D6B0000456A0000996B0000D3",0xd,0xa};
+{      0x53  ,0x33 ,0x31  ,0x35 ,0x30 ,0x30 ,0x30 ,0x30 ,0x30
+      ,0x30  ,0x38 ,0x30  ,0x38 ,0x35 ,0x35 ,0x32 ,0x30
+      ,0x30  ,0x30 ,0x30  ,0x30 ,0x30 ,0x30 ,0x30 ,0x30
+      ,0x30  ,0x30 ,0x30  ,0x30 ,0x30 ,0x30 ,0x30 ,0x30
+      ,0x30  ,0x30 ,0x30  ,0x30 ,0x30 ,0x30 ,0x30 };//      ,0x30  ,0x30  ,0x39  ,0x33  ,0x0D  ,0x0A};
+
+void testmessage_in(void);
+static int tmp_count_in_message_input;
+void testmessage_in(void)
+{
+    fsp_err_t err = FSP_SUCCESS;    // error status
+    flash_lp_code_flash_operations(flash_blocks_num++,block_data,64);
+
+
+}
+
+
+fsp_err_t ReadBlockOtap(int argc, uint8_t *bufin)
+{
+//    fsp_err_t err= FSP_SUCCESS;
+//    struct srec_state srec;
+    int count=0;
+    int
+    tmp_count_in_message_input=0;
+    while (tmp_count_in_message_input< argc)
+    {
+            block_data[current_position_in_block++]   = bufin[tmp_count_in_message_input++] ;
+            if (count==FLASH_BLOCK_SIZE)
+            { // program block to scratcpad flash
+          // temp removed y.f. 31/10/22      flash_lp_code_flash_operations(flash_blocks_num++,block_data,FLASH_BLOCK_SIZE);
+                ClearflashBlock_Data();
+            }
+    }
+    if (argc < NewFirmware.NewTotalBytesInPacket)
+    { // handle last message in file
+        flash_lp_code_flash_operations(flash_blocks_num++,block_data,FLASH_BLOCK_SIZE);
+        ClearflashBlock_Data();
+    }
+
+}
+
+
+#if 0
+    while (tmp_count_in_message_input< argc)
+    {
+        buf[ind] =   bufin[tmp_count_in_message_input++];
+
+        if ((buf[ind]==0xa) && (buf[ind-1] ==0xd))
+        { // end of line start
+            // calculate c.s.
+
+
+
+            if (! ((buf[0]== SREC_START) &&  (buf[1]== SREC_START_HEADER)))  // Ignore start header record
+            {
+
+              if (srec_read_bytes(&srec, buf, ind) != FSP_SUCCESS)
+                  return FSP_ERR_INVALID_ARGUMENT;
+                for (uint8_t bInd = 0 ; bInd < srec.length-5; bInd)
+                {
+                  // check if exceed the block data size
+                  if (current_position_in_block >=  FLASH_BLOCK_SIZE)
+                  { //
+                   // writeBlockFlash(address_position_in_flash); // t.b.d.
+                    ClearflashBlock_Data();
+                    address_position_in_flash+=FLASH_BLOCK_SIZE;
+                    flash_blocks_num++;   // for writng to flash only
+                    flash_lp_code_flash_operations(flash_blocks_num,block_data,FLASH_BLOCK_SIZE)
+                  }
+                  block_data[current_position_in_block + bInd ] = srec.data[bInd+7];
+                }
+                current_position_in_block+= srec.length-5;
+
+            }
+            ind =0;
+        }else ind++;
+    }
+
+    // write last block;
+
+    int count;
+    while (fgets(buf, sizeof(buf), bufin)) {
+        count = (srec_count_t) strlen(buf);
+        srec_read_bytes(&srec, buf, count);
+        line_number += (count && buf[count - 1] == '\n');
+    }
+    srec_end_read(&srec);
+
+    return FSP_SUCCESS;
+
+   
+}
+
+
+fsp_err_t srec_read_bytes (struct srec_state * restrict srec,
+                 const char * restrict data,
+                 srec_count_t count) {
+    fsp_err_t err = FSP_SUCCESS;     // Error status
+
+    while ((count > 0) &&  (err == FSP_SUCCESS)){
+       err = srec_read_byte(srec, *data++) ;
+        --count;
+    }
+    return err;
+}
+
+void srec_begin_read (struct srec_state *srec) {
+    srec->flags = 0;
+    srec->byte_count = 0;
+    srec->length = 0;
+    tmp_count_in_message_input=0;
+}
+
+
+fsp_err_t srec_read_byte (struct srec_state *srec, char byte) 
+{
+    fsp_err_t err = FSP_SUCCESS;
+    uint_fast8_t b = (uint_fast8_t) byte;
+    uint_fast8_t state = (srec->flags & SREC_READ_STATE_MASK);
+    srec->flags ^= state; // turn off the old state
+
+    if (b >= '0' && b <= '9') {
+        b -= '0';
+    } else if (b >= 'A' && b <= 'F') {
+        b -= 'A' - 10;
+    } else if (b >= 'a' && b <= 'f') {
+        b -= 'a' - 10;
+    } else if (b == SREC_START) {
+        // sync to a new record at any state
+        state = READ_RECORD_TYPE;
+        goto end_read;
+    } else {
+        // ignore unknown characters (e.g., extra whitespace)
+        goto save_read_state;
+    }
+
+    if (!(++state & 1)) {
+        // high nybble, store temporarily at end of data:
+        b <<= 4;
+        if (state != READ_GOT_RECORD_TYPE) {
+            srec->data[srec->length] = b;
+        } else {
+            ++state;
+            srec->flags = b;
+        }
+    } 
+    else 
+    {
+        // low nybble, combine with stored high nybble:
+        b = (srec->data[srec->length] |= b);
+        switch (state >> 1) {
+        default:
+            // remain in initial state while waiting for S
+            return;
+        case (READ_COUNT_LOW >> 1):
+            srec->byte_count = b;
+#if SREC_LINE_MAX_BYTE_COUNT < 255
+            if (b > SREC_LINE_MAX_BYTE_COUNT) {
+               
+                err =   srec_end_read(srec);
+            }
+#endif
+            break;
+        case (READ_DATA_LOW >> 1):
+            if (++(srec->length) < srec->byte_count) {
+                state = READ_DATA_HIGH;
+                goto save_read_state;
+            }
+            // end of line
+            state = READ_WAIT_FOR_START;
+        end_read:
+            err =  srec_end_read(srec);
+        }
+    }
+save_read_state:
+    srec->flags |= state;
+    return err;
+}
+
+
+fsp_err_t srec_end_read (struct srec_state *srec) {
+    fsp_err_t err = FSP_SUCCESS;
+    uint8_t *r = srec->data;
+    uint8_t *eptr;
+    srec_address_t address = 0;
+    uint_fast8_t type = (srec->flags & SREC_RECORD_TYPE_MASK) >> 4;
+    uint8_t sum = srec->length;
+
+    if (!srec->byte_count) {
+        return FSP_ERR_INVALID_ARGUMENT;
+    }
+
+    // validate the checksum (one's complement of 8-bit sum)
+    for (eptr = r + sum; r != eptr; ++r) {
+        sum += *r;
+    }
+    ++sum; // sum is now 0 if the checksum was correct
+    // y.f. add checksum error rern  
+    if (sum) return FSP_ERR_INVALID_ARGUMENT;
+    // combine the address bytes
+    r = srec->data;
+    eptr = r + SREC_ADDRESS_BYTE_COUNT(type); // byte count >= 2
+    do {
+        address <<= 8;
+        address |= *r;
+    } while (++r != eptr);
+
+    //    r = srec->data + srec->length;
+    //    t.b.d. y.f. 19/10/22  srec_data_read(srec, type, address, eptr,
+    //               (srec_count_t) ((r > eptr) ? ((r - eptr) - 1) : 0), sum);
+
+    srec->flags = 0;
+    srec->length = 0;
+    srec->byte_count = 0;
+    return FSP_SUCCESS;
+}
+
+#endif
+
+
+
+
+
+
+
