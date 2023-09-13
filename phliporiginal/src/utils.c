@@ -4,6 +4,7 @@
 #include "string.h"
 #include <stdlib.h>
 
+
 uint8_t ConvertHex2BCD(uint8_t bData );
 uint8_t calcCS(uint8_t *pbytes, uint16_t plen);
 
